@@ -25,6 +25,11 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addImport("build.zig.zon", build_zig_zon);
 
+    exe.root_module.addImport("args", b.dependency("args", .{
+        .target = target,
+        .optimize = optimize,
+    }).module("args"));
+
     b.installArtifact(exe);
 
     const run_step = b.step("run", "Run the app");

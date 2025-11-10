@@ -1,9 +1,15 @@
 .{
     .name = .gotify_init,
+    .description = "A simple CLI tool that calls Gotify's API(s) to create applications (if missing) and export applications' tokens.",
     .version = "0.0.0",
     .fingerprint = 0xc9570247694767f7, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
-    .dependencies = .{},
+    .dependencies = .{
+        .args = .{
+            .url = "git+https://github.com/ikskuh/zig-args#8ae26b44a884ff20dca98ee84c098e8f8e94902f",
+            .hash = "args-0.0.0-CiLiqojRAACGzDRO7A9dw7kWSchNk29caJZkXuMCb0Cn",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
