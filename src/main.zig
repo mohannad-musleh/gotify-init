@@ -4,7 +4,14 @@ const argsParser = @import("args");
 const http = std.http;
 const Base64StandardEncoder = std.base64.standard.Encoder;
 
-const ExportFormat = enum { json, keyval };
+const project_name = @tagName(build_zig_zon.name);
+const version = build_zig_zon.version;
+const description = build_zig_zon.description;
+
+const BASIC_AUTH_HEADER_NAME = "Authorization";
+const GOTIFY_CLIENT_TOKEN_HEADER_NAME = "X-Gotify-Key";
+
+const ExportFormat = enum { json, dotenv };
 
 const Options = struct {
     @"gotify-base-url": ?[]const u8 = null,
@@ -49,6 +56,11 @@ const Options = struct {
             \\    NOTES:
             \\      - Flags have higher precedence over environment variables.
             \\      - Client Token has higher precedence over Basic Auth, if both passed, the "Basic Auth" will not be used.
+            \\
+            \\Output format:
+            \\  - json: a json string will be printed with a root object contains all apps names as attribute/key and the for each one is the application token.
+            \\  - dotenv: a key-value format that can be used with dotenv (.env) format. the key is the application name and the value is the application token.
+            \\    - NOTE: the application name/key will be modified, all spaces will be replaced with `_` (underscore) and all letters will be capitalized.
         ),
         .option_docs = .{
             .@"gotify-base-url" = "The base url for Gotify server (default: GOTIFY_BASE_URL environment variable value).",
@@ -62,13 +74,6 @@ const Options = struct {
         },
     };
 };
-
-const project_name = @tagName(build_zig_zon.name);
-const version = build_zig_zon.version;
-const description = build_zig_zon.description;
-
-const BASIC_AUTH_HEADER_NAME = "Authorization";
-const GOTIFY_CLIENT_TOKEN_HEADER_NAME = "X-Gotify-Key";
 
 const GotifyApplication = struct {
     id: usize, // Application unique identifier.
@@ -219,7 +224,7 @@ pub fn main() u8 {
 
     const gotify_base_uri_str = options.@"gotify-base-url" orelse env.get("GOTIFY_BASE_URL") orelse "";
     if (gotify_base_uri_str.len < 1) {
-        std.debug.print("--gotify_url is required\n", .{});
+        std.debug.print("gotify base url is required\n", .{});
         return 1;
     }
 
@@ -282,52 +287,92 @@ pub fn main() u8 {
     };
     defer arena.free(existing_applications_list);
 
-    var applications = std.hash_map.StringHashMap(*const GotifyApplication).init(arena);
-    defer applications.deinit();
+    const max_applications_count = existing_applications_list.len + positionals.len;
 
-    applications.ensureTotalCapacity(@intCast(existing_applications_list.len + positionals.len)) catch return oom();
-    for (existing_applications_list) |*app| {
-        std.debug.print("{d}: {s} (token: {s})\n", .{ app.id, app.name, app.token });
-        applications.putAssumeCapacity(app.name, app);
+    var applications = std.ArrayList(GotifyApplication).initCapacity(arena, max_applications_count) catch return oom();
+    defer applications.deinit(arena);
+
+    var applications_names_set = std.hash_map.StringHashMap(void).init(arena);
+    defer applications_names_set.deinit();
+    applications_names_set.ensureTotalCapacity(@truncate(max_applications_count)) catch return oom();
+
+    for (existing_applications_list) |app| {
+        applications_names_set.putAssumeCapacity(app.name, {});
+        applications.appendAssumeCapacity(app);
     }
 
-    var missing_applications = std.hash_map.StringHashMap(void).init(arena);
-    defer missing_applications.deinit();
-    missing_applications.ensureTotalCapacity(@intCast(positionals.len)) catch return oom();
+    var missing_applications_names = std.hash_map.StringHashMap(void).init(arena);
+    defer missing_applications_names.deinit();
+    missing_applications_names.ensureTotalCapacity(@intCast(positionals.len)) catch return oom();
 
-    for (positionals) |app_name| {
-        if (applications.contains(app_name)) continue;
-        missing_applications.putAssumeCapacity(app_name, {});
+    for (positionals) |p| {
+        const app_name = std.mem.trim(u8, p, &std.ascii.whitespace);
+        if (app_name.len < 1 or applications_names_set.contains(app_name)) continue;
+        missing_applications_names.putAssumeCapacity(app_name, {});
+        applications_names_set.putAssumeCapacity(app_name, {}); // added here to prevent duplicate applications' names.
     }
 
-    var iter = missing_applications.keyIterator();
-    while (iter.next()) |app_name| {
-        const payload: CreateApplicationPayload = .{
-            .name = app_name.*,
-        };
-        const new_app = Gotify.create_application(&client, &gotify_base_uri, auth_header, payload) catch |err| {
-            std.debug.print("Failed to create \"{s}\" applcation: {s}\n", .{ app_name.*, @errorName(err) });
-            return 1;
-        };
+    {
+        var iter = missing_applications_names.keyIterator();
+        while (iter.next()) |app_name_ptr| {
+            const app_name = app_name_ptr.*;
+            const new_app = Gotify.create_application(&client, &gotify_base_uri, auth_header, .{ .name = app_name }) catch |err| {
+                std.debug.print("Failed to create \"{s}\" applcation: {s}\n", .{ app_name, @errorName(err) });
+                return 1;
+            };
 
-        applications.put(new_app.name, &new_app) catch return oom();
+            applications.appendAssumeCapacity(new_app);
+        }
     }
 
-    std.debug.print("----------------------[AFTER]-----------------\n", .{});
-    var apps_iter = applications.iterator();
-    while (apps_iter.next()) |entry| {
-        const app = entry.value_ptr.*.*;
-        std.debug.print("{d}: {s} (token: {s})\n", .{ app.id, app.name, app.token });
-    }
+    const applications_list = applications.toOwnedSlice(arena) catch return oom();
+    std.sort.block(
+        GotifyApplication,
+        applications_list,
+        @as(void, {}),
+        struct {
+            fn lessThan(_: void, app1: GotifyApplication, app2: GotifyApplication) bool {
+                return app1.id < app2.id;
+            }
+        }.lessThan,
+    );
 
-    // TODO:
-    // - find a way to sort applications by id (for consistent output)
-    // - print the output in the target format
+    switch (options.format) {
+        .json => {
+            const e = struct {
+                fn e(err: anyerror) u8 {
+                    std.debug.print("Something went wrong while writing the json: {s}\n", .{@errorName(err)});
+                    return 1;
+                }
+            }.e;
+
+            var s: std.json.Stringify = .{ .writer = stdout, .options = .{ .whitespace = .minified } };
+            s.beginObject() catch |err| return e(err);
+            for (applications_list) |app| {
+                s.objectField(app.name) catch |err| return e(err);
+                s.write(app.token) catch |err| return e(err);
+            }
+            s.endObject() catch |err| return e(err);
+            stdout.print("\n", .{}) catch return 1;
+            stdout.flush() catch return 1;
+        },
+        .dotenv => {
+            var output_arena_allocator = std.heap.ArenaAllocator.init(arena);
+            defer output_arena_allocator.deinit();
+            const allocator = output_arena_allocator.allocator();
+            for (applications_list) |app| {
+                const app_name = std.ascii.allocUpperString(allocator, app.name) catch return oom();
+                _ = std.mem.replace(u8, app_name, " ", "_", app_name);
+                stdout.print("{s}={s}\n", .{ app_name, app.token }) catch return 1;
+            }
+            stdout.flush() catch return 1;
+        },
+    }
 
     return 0;
 }
 
-fn comptimeJoin(comptime parts: []const []const u8, comptime sep: []const u8) []const u8 {
+inline fn comptimeJoin(comptime parts: []const []const u8, comptime sep: []const u8) []const u8 {
     comptime {
         if (parts.len < 1) {
             return "";
@@ -358,11 +403,6 @@ fn comptimeJoin(comptime parts: []const []const u8, comptime sep: []const u8) []
     }
 }
 
-inline fn clear(stdout: *std.Io.Writer) void {
-    stdout.writeAll("\x1B[2J\x1B[H") catch return; // clear screen
-    stdout.flush() catch return;
-}
-
 inline fn oom() u8 {
     std.debug.print("OUT OF MEMORY!\n", .{});
     return 1;
@@ -375,7 +415,7 @@ fn readPassword(allocator: std.mem.Allocator, comptime msg: []const u8) ![]const
     // See: https://github.com/eltNEG/passprompt/blob/1ef9720c9fb559a0364c2ec47fd7d4cdba6f2301/src/root.zig#L7
     var term = try std.posix.tcgetattr(stdin.handle);
     defer {
-        // Defer used to garanty the ECHO mode is (re)enabled even if the logic fails.
+        // Defer used to guaranty the ECHO mode is (re)enabled even if the logic fails.
         term.lflag.ECHO = true;
         std.posix.tcsetattr(stdin.handle, .NOW, term) catch {};
     }
