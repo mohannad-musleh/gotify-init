@@ -13,6 +13,8 @@ const GOTIFY_CLIENT_TOKEN_HEADER_NAME = "X-Gotify-Key";
 
 const ExportFormat = enum { json, dotenv };
 
+const ApplicationArrayList = std.ArrayList(GotifyApplication);
+
 const Options = struct {
     @"gotify-base-url": ?[]const u8 = null,
     @"gotify-client-token": ?[]const u8 = null,
@@ -20,8 +22,13 @@ const Options = struct {
     @"gotify-user-password": ?[]const u8 = null,
     output: ?[]const u8 = null,
     format: ExportFormat = .json,
+    @"json-output-map": ?[]const u8 = null,
+    @"json-format-keys": bool = false,
+    @"json-exclude-not-mapped-applications": bool = false,
     help: bool = false,
     version: bool = false,
+
+    pub const wrap_len = 100;
 
     pub const shorthands = .{
         .o = "output",
@@ -30,6 +37,8 @@ const Options = struct {
         .t = "gotify-client-token",
         .u = "gotify-user-username",
         .p = "gotify-user-password",
+        .k = "json-format-keys",
+        .e = "json-exclude-not-mapped-applications",
         .h = "help",
         .v = "version",
     };
@@ -59,6 +68,20 @@ const Options = struct {
             \\
             \\Output format:
             \\  - json: a json string will be printed with a root object contains all apps names as attribute/key and the for each one is the application token.
+            \\    - You can specify --json-output-map to customize the output
+            \\      E.g --json-output-map '{"gotify_app1": "gotify_app_1_token", "gotify_app2": "a.deep.attribute.GOTIFY_TOKEN"}'
+            \\      The output will be:
+            \\      {
+            \\          "gotify_app_1_token": "{token of 'gotify_app1' app}",
+            \\          "a": {
+            \\              "deep": {
+            \\                  "attribute": {
+            \\                      "GOTIFY_TOKEN": "{token of 'gotify_app2' app}"
+            \\                  }
+            \\              }
+            \\          }
+            \\      }
+            \\
             \\  - dotenv: a key-value format that can be used with dotenv (.env) format. the key is the application name and the value is the application token.
             \\    - NOTE: the application name/key will be modified, all spaces will be replaced with `_` (underscore) and all letters will be capitalized.
         ),
@@ -69,6 +92,18 @@ const Options = struct {
             .@"gotify-user-password" = "The Gotify's user password for basic authentication (default: GOTIFY_AUTH_PASSWORD environment variable value).",
             .output = "The path to the file to write the output/result into (by default, the result will be printed to stdout)",
             .format = std.fmt.comptimePrint("the output format (default: json). available opetions: {s}", .{comptimeJoin(std.meta.fieldNames(ExportFormat), ", ")}),
+            .@"json-output-map" = "For \"json\" output format, you can specify a json string " ++
+                "to map where the token of each application token will be stored " ++
+                "in the output. Any left out app names, they will be stored in " ++
+                "the default plcace (root level).",
+            .@"json-exclude-not-mapped-applications" = "When the output format " ++
+                "is json, and the --json-output-map is specifed, passing " ++
+                "this flag will exclude the Gotify applications that not " ++
+                "included in the map.",
+            .@"json-format-keys" = "for json output format, passing this flag " ++
+                "to make sure all attribute names are usable as environment " ++
+                "variable name (by replacing the spaces with \"_\" and " ++
+                "capitalize all letters).",
             .help = "Print this help and exit.",
             .version = "Display the version of " ++ project_name ++ " and exit.",
         },
@@ -188,7 +223,7 @@ pub fn main() u8 {
 
     var stdout_buffer: [1024]u8 = undefined;
     var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
+    var stdout = &stdout_writer.interface;
 
     const parsed_args = argsParser.parseForCurrentProcess(Options, arena, .print) catch return 1;
     const options = parsed_args.options;
@@ -215,6 +250,26 @@ pub fn main() u8 {
     if (positionals.len < 1) {
         std.debug.print("Specify at least on application to be created\n", .{});
         return 1;
+    }
+
+    const json_output_map_str = options.@"json-output-map";
+    var parsed_json_output_map: ?std.json.Parsed(std.json.Value) = null;
+    var json_output_map: ?std.json.Value = null;
+
+    if (options.format == .json) {
+        if (json_output_map_str) |m| {
+            parsed_json_output_map = std.json.parseFromSlice(std.json.Value, arena, m, .{ .parse_numbers = false }) catch {
+                std.debug.print("Invalid json value for --json-output-map flag", .{});
+                return 1;
+            };
+
+            if (parsed_json_output_map.?.value == .object) {
+                json_output_map = parsed_json_output_map.?.value;
+            } else {
+                std.debug.print("The json output map must be a single root object and all keys and values must be strings\n", .{});
+                return 1;
+            }
+        }
     }
 
     const env = std.process.getEnvMap(arena) catch |err| {
@@ -289,7 +344,7 @@ pub fn main() u8 {
 
     const max_applications_count = existing_applications_list.len + positionals.len;
 
-    var applications = std.ArrayList(GotifyApplication).initCapacity(arena, max_applications_count) catch return oom();
+    var applications = ApplicationArrayList.initCapacity(arena, max_applications_count) catch return oom();
     defer applications.deinit(arena);
 
     var applications_names_set = std.hash_map.StringHashMap(void).init(arena);
@@ -325,17 +380,9 @@ pub fn main() u8 {
         }
     }
 
-    const applications_list = applications.toOwnedSlice(arena) catch return oom();
-    std.sort.block(
-        GotifyApplication,
-        applications_list,
-        @as(void, {}),
-        struct {
-            fn lessThan(_: void, app1: GotifyApplication, app2: GotifyApplication) bool {
-                return app1.id < app2.id;
-            }
-        }.lessThan,
-    );
+    var output_arena_allocator = std.heap.ArenaAllocator.init(arena);
+    defer output_arena_allocator.deinit();
+    const output_allocator = output_arena_allocator.allocator();
 
     switch (options.format) {
         .json => {
@@ -347,21 +394,80 @@ pub fn main() u8 {
             }.e;
 
             var s: std.json.Stringify = .{ .writer = stdout, .options = .{ .whitespace = .minified } };
-            s.beginObject() catch |err| return e(err);
-            for (applications_list) |app| {
-                s.objectField(app.name) catch |err| return e(err);
-                s.write(app.token) catch |err| return e(err);
+            if (json_output_map) |f| {
+                var applications_map: std.StringHashMap(GotifyApplication) = .init(output_allocator);
+                applications_map.ensureUnusedCapacity(@intCast(applications.items.len)) catch return oom();
+                for (applications.items) |app| applications_map.putAssumeCapacity(app.name, app);
+
+                var output_object: std.json.Value = .{ .object = .init(output_allocator) };
+
+                for (f.object.keys()) |gotify_app_key| {
+                    const gotify_app_token_attribute_path = kblk: {
+                        if (f.object.get(gotify_app_key)) |kv| if (kv == .string) break :kblk kv.string;
+
+                        std.debug.print("The json output map keys and values must be strings\n", .{});
+                        return 1;
+                    };
+
+                    var rev_iter = std.mem.splitBackwardsScalar(u8, gotify_app_token_attribute_path, '.');
+
+                    var child_key: ?[]const u8 = null;
+                    var child_value: ?std.json.Value = null;
+                    while (rev_iter.next()) |part| {
+                        const app = applications_map.get(gotify_app_key) orelse {
+                            std.debug.print("Gotify application \"{s}\" not found\n.", .{gotify_app_key});
+                            return 1;
+                        };
+
+                        if (child_value == null) {
+                            child_key = part;
+                            child_value = .{ .string = app.token };
+                        } else {
+                            var o: std.json.Value = .{ .object = .init(output_allocator) };
+                            o.object.put(child_key.?, child_value.?) catch return oom();
+                            child_key = part;
+                            child_value = o;
+                            if (rev_iter.index == null) output_object.object.put(child_key.?, child_value.?) catch return oom();
+                        }
+                    }
+                }
+
+                if (!options.@"json-exclude-not-mapped-applications") {
+                    for (toOwnedOrderdSlice(output_allocator, &applications) catch return oom()) |app| {
+                        const app_name = if (options.@"json-format-keys") fblk: {
+                            const app_name = std.ascii.allocUpperString(output_allocator, app.name) catch return oom();
+                            _ = std.mem.replace(u8, app_name, " ", "_", app_name);
+                            break :fblk app_name;
+                        } else app.name;
+                        if (!f.object.contains(app.name)) {
+                            _ = output_object.object.getOrPutValue(app_name, .{ .string = app.token }) catch return oom();
+                        }
+                    }
+                }
+                var w: std.Io.Writer.Allocating = .init(output_allocator);
+                defer w.deinit();
+                std.json.fmt(output_object, .{}).format(stdout) catch |err| std.debug.print("Failed to stringify the json: {s}\n", .{@errorName(err)});
+
+                stdout.flush() catch return 1;
+            } else {
+                s.beginObject() catch |err| return e(err);
+                for (toOwnedOrderdSlice(output_allocator, &applications) catch return oom()) |app| {
+                    const app_name = if (options.@"json-format-keys") fblk: {
+                        const app_name = std.ascii.allocUpperString(output_allocator, app.name) catch return oom();
+                        _ = std.mem.replace(u8, app_name, " ", "_", app_name);
+                        break :fblk app_name;
+                    } else app.name;
+                    s.objectField(app_name) catch |err| return e(err);
+                    s.write(app.token) catch |err| return e(err);
+                }
+                s.endObject() catch |err| return e(err);
+                stdout.print("\n", .{}) catch return 1;
+                stdout.flush() catch return 1;
             }
-            s.endObject() catch |err| return e(err);
-            stdout.print("\n", .{}) catch return 1;
-            stdout.flush() catch return 1;
         },
         .dotenv => {
-            var output_arena_allocator = std.heap.ArenaAllocator.init(arena);
-            defer output_arena_allocator.deinit();
-            const allocator = output_arena_allocator.allocator();
-            for (applications_list) |app| {
-                const app_name = std.ascii.allocUpperString(allocator, app.name) catch return oom();
+            for (toOwnedOrderdSlice(output_allocator, &applications) catch return oom()) |app| {
+                const app_name = std.ascii.allocUpperString(output_allocator, app.name) catch return oom();
                 _ = std.mem.replace(u8, app_name, " ", "_", app_name);
                 stdout.print("{s}={s}\n", .{ app_name, app.token }) catch return 1;
             }
@@ -427,4 +533,19 @@ fn readPassword(allocator: std.mem.Allocator, comptime msg: []const u8) ![]const
     while (bytes_read < 1) bytes_read = (try stdin.read(&stdin_buffer)) - 1;
 
     return allocator.dupe(u8, stdin_buffer[0..bytes_read]);
+}
+
+fn toOwnedOrderdSlice(allocator: std.mem.Allocator, apps: *ApplicationArrayList) !ApplicationArrayList.Slice {
+    const applications_list = apps.toOwnedSlice(allocator) catch |err| return err;
+    std.sort.block(
+        GotifyApplication,
+        applications_list,
+        @as(void, {}),
+        struct {
+            fn lessThan(_: void, app1: GotifyApplication, app2: GotifyApplication) bool {
+                return app1.id < app2.id;
+            }
+        }.lessThan,
+    );
+    return applications_list;
 }
