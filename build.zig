@@ -3,6 +3,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const strip = optimize != .Debug;
     const exe_name = b.option(
         []const u8,
         "exe_name",
@@ -15,6 +16,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
         }),
     });
 
@@ -22,6 +24,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("build.zig.zon"),
         .target = target,
         .optimize = optimize,
+        .strip = strip,
     });
     exe.root_module.addImport("build.zig.zon", build_zig_zon);
 
