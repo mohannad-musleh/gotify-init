@@ -1,7 +1,7 @@
 .{
     .name = .gotify_init,
     .description = "A simple CLI tool that calls Gotify's API(s) to create applications (if missing) and export applications' tokens.",
-    .version = "0.0.0",
+    .version = "0.0.1",
     .fingerprint = 0xc9570247694767f7, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
     .dependencies = .{
